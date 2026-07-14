@@ -1,0 +1,86 @@
+%% Agent Turn Sequence — openhands_all/app_server
+%% NOTE: app_server is the control plane. The actual agent loop
+%% (system prompt render, model stream, tool-call detection, permission
+%% enforcement, tool execution) runs in the EXTERNAL agent-server, which
+%% is NOT vendored in this repo. Those steps are marked [EXTERNAL].
+%% Citations are file :: symbol / call site (line).
+
+sequenceDiagram
+    autonumber
+    actor User
+    participant Router as app_conversation_router.py<br/>start_app_conversation (:365)
+    participant Svc as live_status_app_conversation_service.py<br/>LiveStatusAppConversationService
+    participant Base as app_conversation_service_base.py<br/>AppConversationServiceBase
+    participant Skills as skill_loader.py / hook_loader.py
+    participant Settings as settings/* store
+    participant TaskDB as sql_app_conversation_start_task_service.py<br/>StoredAppConversationStartTask
+    participant Sandbox as sandbox/* service
+    participant Agent as agent-server [EXTERNAL]<br/>openhands.sdk / openhands.tools
+    participant Webhook as event_callback/webhook_router.py<br/>on_event (:468)
+    participant EventStore as event/event_service_base.py<br/>save_event (:190)
+    participant CB as sql_event_callback_service.py<br/>+ set_title_callback_processor.py
+    participant Pending as pending_messages/*
+
+    %% ---- 1. User input / session creation ----
+    User->>Router: POST /api/v1/app-conversations<br/>AppConversationStartRequest (models :221)
+    Router->>Svc: start_app_conversation(start_request) (:381)
+    Svc->>Svc: _start_app_conversation() status=WORKING (:361)
+    Svc-->>Router: yield first task (WORKING)
+    Router-->>User: return AppConversationStartTask (:382,:407)
+    Router->>Router: asyncio.create_task(_consume_remaining) (:406)
+
+    %% ---- 2. Sandbox provisioning ----
+    Svc->>Sandbox: start_sandbox / wait_for_sandbox_running<br/>(status WAITING_FOR_SANDBOX :888)
+    Sandbox->>Sandbox: inject OH_WEBHOOKS_0_BASE_URL<br/>(sandbox_service.py:26)
+    Sandbox-->>Svc: SandboxInfo (agent_server_url)
+    Svc->>TaskDB: save_app_conversation_start_task (:356 -> :235)
+
+    %% ---- 3. Instruction / repo / hooks / skills loading ----
+    Svc->>Base: run_setup_scripts() (:269)
+    Base->>Agent: AsyncRemoteWorkspace.execute_command git clone (:414) [EXTERNAL]
+    Base->>Agent: file_upload git/pre-commit.sh -> .git/hooks (:599)
+    Base->>Skills: load_skills_from_agent_server (:505) / load_hooks_from_agent_server (:103)
+    Skills->>Agent: POST /api/skills, POST /api/hooks [EXTERNAL]
+    Agent-->>Skills: Skill[] / HookConfig
+    Svc->>TaskDB: persist status transitions (PREPARING/SETUP/HOOKS/SKILLS)
+
+    %% ---- 4. System prompt + request assembly ----
+    Svc->>Settings: SettingsStore.load(resolve_agent_profile=True)
+    Settings-->>Svc: agent_settings (LLM, tools, confirmation_mode)
+    Svc->>Svc: _build_start_conversation_request_for_user (:1630)
+    Note over Svc: _configure_llm stream=True (:1215)<br/>assemble system_message_suffix<br/>create_agent() (:1808) [EXTERNAL]<br/>_select_confirmation_policy (base :677)<br/>create_request(StartConversationRequest) (:1925) [EXTERNAL]
+
+    %% ---- 5. Dispatch turn to agent-server ----
+    Svc->>Agent: POST /api/conversations (body expose_secrets) (:486) [EXTERNAL]
+    Agent-->>Svc: ConversationInfo (:509)
+    Svc->>TaskDB: save status=READY (app_conversation_id set)
+
+    %% ---- 6. EXTERNAL agent loop ----
+    rect rgb(235,235,235)
+    Note over Agent: [EXTERNAL] system prompt -> LLM.stream<br/>-> tool-call detection (ActionEvent)<br/>-> confirmation/permission gate<br/>-> tool execution -> ObservationEvent<br/>-> feed back -> iterate (unverified internals)
+    loop each iteration
+        Agent->>Agent: model stream + tool exec
+        Agent->>Webhook: POST /api/v1/webhooks/events/{id} (:468)
+        Webhook->>EventStore: save_event(conversation_id, event) (:480)
+        Webhook->>Webhook: reconcile stats / llm switch / execution_status (:486-532)
+        Webhook->>CB: background _run_callbacks_in_bg_and_close (:534,:583)
+        CB->>CB: get_active_callbacks + invoke_callback (:204,:284)
+        CB->>Agent: SetTitleCallbackProcessor polls title (:37) [EXTERNAL read]
+    end
+    end
+
+    %% ---- 7. Pending / follow-up input (next iteration) ----
+    opt queued pending messages on READY
+        Svc->>Pending: update_conversation_id + get_pending_messages (:2226,:2238)
+        Svc->>Agent: POST /api/conversations/{id}/events run=true (:2256) [EXTERNAL]
+        Svc->>Pending: delete_messages_for_conversation (:2273)
+    end
+    opt live follow-up
+        User->>Router: POST /{id}/send-message (send_message_to_conversation :441)
+        Router->>Agent: POST /api/conversations/{id}/events (:556) [EXTERNAL]
+    end
+
+    %% ---- 8. Final response read ----
+    Agent->>Webhook: final MessageEvent + terminal ConversationStateUpdateEvent
+    Webhook->>EventStore: save_event (persist final response)
+    User->>User: read via event_router.py search_events (:29) (REST, no SSE in app_server)
