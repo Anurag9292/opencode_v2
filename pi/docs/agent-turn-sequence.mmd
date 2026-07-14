@@ -1,0 +1,54 @@
+sequenceDiagram
+    autonumber
+    actor User
+    participant Mode as Mode (interactive/print/rpc)
+    participant Session as AgentSession
+    participant Res as DefaultResourceLoader
+    participant SP as buildSystemPrompt
+    participant Agent as Agent (pi-agent-core)
+    participant Loop as runAgentLoop / runLoop
+    participant AI as streamFn → streamSimple (pi-ai)
+    participant Ext as ExtensionRunner
+    participant Tool as AgentTool.execute
+    participant SM as SessionManager
+
+    Note over Session,Res: Session creation (createAgentSession) happens once before turn
+    Res->>SP: getAgentsFiles / getSkills / getSystemPrompt
+    SP-->>Session: base system prompt (agent.state.systemPrompt)
+
+    User->>Mode: types input
+    Mode->>Session: prompt(text, options)
+    Session->>Ext: emitInput / emitBeforeAgentStart
+    Session->>Session: expand skills+templates, validate model+auth
+    Session->>Agent: prompt(messages)  [_runAgentPrompt]
+    Agent->>Loop: runAgentLoop(...)
+    Loop-->>Session: agent_start, turn_start, message_start/end (user)
+
+    loop until no tool calls (terminate)
+        Loop->>Loop: convertToLlm(messages) → Context
+        Loop->>AI: streamFn(model, context)
+        AI->>Ext: before_provider_headers / before_provider_request
+        AI-->>Loop: start, text_delta..., toolcall_..., done
+        Loop-->>Session: message_start / message_update / message_end (assistant)
+        Session->>SM: appendMessage(assistant)
+
+        alt assistant requested tool calls
+            Loop->>Loop: detect content[type==toolCall]
+            Loop->>AI: validateToolArguments(tool, call)
+            Loop->>Ext: beforeToolCall → tool_call hook (permission)
+            alt blocked
+                Ext-->>Loop: { block:true } → error result
+            else allowed
+                Loop->>Tool: execute(id, args, signal, onUpdate)
+                Tool-->>Loop: result (+tool_execution_update/end)
+                Loop->>Ext: afterToolCall → tool_result hook
+            end
+            Loop-->>Session: message_start/end (toolResult)
+            Session->>SM: appendMessage(toolResult)
+        end
+    end
+
+    Loop-->>Session: agent_end
+    Session->>Session: _handlePostAgentRun (retry / compaction / follow-ups)
+    Session-->>Mode: agent_settled + final message
+    Mode-->>User: renders response
