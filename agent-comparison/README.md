@@ -17,6 +17,7 @@ and *why* each made the design choices it did — not a feature checklist.
 | [`07-comparison-tables.md`](07-comparison-tables.md) | All required comparison tables in one place |
 | [`08-unique-ideas-and-design-lessons.md`](08-unique-ideas-and-design-lessons.md) | Innovations unique to each + what to borrow for a next-gen agent |
 | [`09-discrepancies-and-caveats.md`](09-discrepancies-and-caveats.md) | Doc-vs-implementation discrepancies and verification caveats |
+| [`10-request-lifecycle-and-memory.md`](10-request-lifecycle-and-memory.md) | **Cognition deep-dive:** trace "build me a todo app" — memory storage, purge/keep policy, sub-agent memory, relevance mechanisms |
 | [`notebooks/`](notebooks/) | Runnable Jupyter notebooks — one per agent + a comparative overview |
 
 ## Sources analyzed (paths relative to repo root `/repo`, the prompt's `home/`)
